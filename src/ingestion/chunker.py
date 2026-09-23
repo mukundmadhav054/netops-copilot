@@ -17,10 +17,8 @@ def _split_recursive(text: str, separators: list[str]) -> list[str]:
         p = p.strip()
         if not p:
             continue
-        if len(p) <= 0:
-            continue
-        # If still too long handled by caller; recurse only when sep present
-        if sep in text and len(separators) > 1 and (len(p) > 0):
+        # Recurse on the next separator only when this separator actually split
+        if sep in text and len(separators) > 1:
             sub = _split_recursive(p, rest)
             out.extend(sub if sub else [p])
         else:
