@@ -1,0 +1,18 @@
+# Render Blueprint: NetOps Copilot (FastAPI agentic RAG, mock-first)
+# Dashboard: New → Blueprint → select repo → Apply.
+# Health endpoint does zero external work (no Qdrant/LLM on that path),
+# so it is safe for Render health checks AND cron-job.org keepalive pings:
+#   GET https://<service-host>/healthz
+# NOTE: PYTHON_VERSION intentionally omitted — Render's current default
+# (3.14.3 per https://docs.render.com/python-version) satisfies
+# requirements.txt; pin only if a newer default breaks the build.
+
+services:
+  - type: web
+    name: netops-copilot
+    runtime: python
+    plan: free
+    rootDir: .
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn src.api.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
