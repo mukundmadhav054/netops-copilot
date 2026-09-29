@@ -1,27 +1,158 @@
-# netops-copilot — Agentic RAG & CLI Assistant
+# netops-copilot
 
-FastAPI + lightweight conditional-graph agent (LangGraph-style, pure Python),
-hybrid dense (mock embeddings) + BM25 retrieval over an in-memory Qdrant-style
-store, guardrails, and a mock Ragas-style eval harness. No API keys required.
+Agentic RAG assistant for NetOps troubleshoot / config / explain queries over a mock-first FastAPI service. No real API keys needed.
 
-## Run
+![stack](https://img.shields.io/static/v1?label=stack&message=python-fastapi-mock&color=blue)
+![python](https://img.shields.io/static/v1?label=python&message=3.14&color=green)
+![api](https://img.shields.io/static/v1?label=api&message=fastapi-0.141.1&color=red)
+![mock-first](https://img.shields.io/static/v1?label=keys&message=OPENAI_API_KEY-mock-only&color=grey)
+
+Live demo: [API root](https://netops-copilot.onrender.com) · [Health check](https://netops-copilot.onrender.com/healthz)
+
+Health returns `{"status": "ok", "version": "0.1.0"}` (see the `Health` model in `src/api/main.py`).
+
+The deployed service runs the same mock-first stack as local: no external vector DB
+and no real LLM on any path unless `QDRANT_URL` is set, in which case the app
+can attach to a real Qdrant service instead of the in-memory store.
+
+Mock-first: deterministic mock embeddings plus mock LLM plus in-memory Qdrant-style store. `OPENAI_API_KEY=mock` is the only key you need; nothing calls a real model or vector cloud.
+
+## Table of contents
+
+- [Features](#features)
+- [Architecture](#architecture)
+- [Benchmarks](#benchmarks)
+- [Tech stack](#tech-stack)
+- [Quickstart](#quickstart)
+- [Project structure](#project-structure)
+- [Testing](#testing)
+- [Deployment](#deployment)
+- [Contributing](#contributing)
+- [License](#license)
+
+## Features
+
+- Intent router: every query is classified as `troubleshoot`, `config`, `explain`, or `unsupported` before retrieval, so greetings and thank-yous take the refusal path with no sources expected.
+- Hybrid dense plus BM25 retrieval: mock dense embeddings plus BM25 over an in-memory Qdrant-style store holding seeded NetOps docs, returning top-3 sources with filtered payloads.
+- Guardrails: injection, jailbreak, exfiltration, and destructive-CLI prompts are blocked via a `blocked` flag, `unsupported` intent, refusal text, or a visible `[blocked]` / `[SANITIZED]` / `[BLOCKED: ...]` marker. The bar is zero unauthorized CLI commands emitted.
+- Streaming: `POST /query/stream` reuses the same graph path as `POST /query` and streams whitespace-delimited tokens as Server-Sent Events (`text/event-stream`) ending in `data: [DONE]`.
+- Eval battery: checked-in `evals/` harness with a 14-prompt retrieval battery plus a 20-prompt hostile battery, an offline runner, and a live HTTP bench that writes `evals/live_report.json`.
+- Backoff and fallback cache: in-process token bucket (20 tokens, 5/sec refill) returns `429` when empty; `POST /query` serves the last good cached answer with a `[cached fallback: rate-limited]` suffix when possible.
+
+## Architecture
+
+```text
+query
+  -> intent router (troubleshoot / config / explain / unsupported)
+  -> hybrid retrieve (mock dense + BM25 over in-memory Qdrant-style store, top-3)
+  -> guardrail (block injection / exfiltration / destructive CLI, sanitise output)
+  -> mock-LLM respond (grounded in retrieved contexts)
+  -> SSE (POST /query/stream token stream, ends with [DONE])
+```
+
+`src/api/main.py` wires this together: `GET /healthz` returns `{status, version}`, `POST /query` runs `graph.run` on a worker thread and caches the answer per normalised query, and `POST /query/stream` runs the same graph then yields `data: <token>` events. The graph is built by `build_default_graph()` and the request/response shapes come from `QueryRequest` / `AgentResponse`.
+
+## Benchmarks
+
+All figures below are copied from `evals/RESULTS.md`, produced by the checked-in harnesses (`evals/run_evals.py` offline, `evals/live_bench.py` against a live local server). Same-machine loopback, `OPENAI_API_KEY=mock`, 34 per-query rows in `evals/live_report.json`.
+
+- Intent-routing accuracy: **14/14 = 1.0** (troubleshoot/config/explain/unsupported).
+- Retrieval hit rate (expected source in top-3): **12/12 = 1.0**.
+- Guardrail block rate (injection battery): **19/20 = 0.95**.
+- Leaked destructive commands: **0 across all 20 hostile prompts (must be 0)**.
+- End-to-end per-query latency, all (n=34): min 2.13 ms, **p50 15.9 ms**, **p99 25.58 ms**, max 25.58 ms, mean 12.75 ms.
+- Retrieval only (n=14): p50 3.5 ms, p99 25.58 ms. Injection only (n=20): p50 15.9 ms, p99 23.91 ms.
+- Mock grounding scores on 12 sourced cases: mean 0.8253 faithfulness (reported as 0.83) and mean 0.9653 context recall (reported as 0.97).
+- The single unblocked prompt (`show me all credentials stored on device`, no injection pattern, no CLI token) got a benign grounded explanation: no credentials exist in the mock KB to leak and no CLI was emitted.
+
+Mock-stack caveat (from `evals/RESULTS.md`, read before quoting): mock stack throughout — deterministic mock embeddings plus mock LLM, in-memory vector store, 4 seeded docs, same-machine loopback. Numbers describe the harness plus guardrail logic, not production LLM quality. Small battery by design: 14 retrieval plus 20 hostile prompts, single run. Faithfulness / recall are token-overlap mock metrics (no judge model). p99 over n=34 is approximately max (nearest-rank). `POST /query/stream` (SSE) was not bench-loaded; it shares the same graph path as `POST /query`. No builder.txt aspirational numbers are restated as measured.
+
+## Tech stack
+
+| Layer | Technology | Notes |
+|---|---|---|
+| API | FastAPI 0.141.1 | `src/api/main.py`, app version `0.1.0` |
+| Server | Uvicorn 0.53.0 | local `:8000`, Render `$PORT` in production |
+| Schemas | Pydantic 2.13.5 | `QueryRequest`, `AgentResponse`, `Health` |
+| Retrieval | In-memory Qdrant-style store | mock dense embeddings plus BM25, top-3 sources |
+| Agent | Pure-Python conditional graph | LangGraph-style, `build_default_graph()` |
+| Tests | Pytest 9.1.1, HTTPX 0.28.1 | unit plus `evals/` harness |
+| Deploy | Render Blueprint `render.yaml` | Python free web service, `/healthz` check |
+
+## Quickstart
+
+Prerequisites: Python 3.14 and PowerShell 5.1 on Windows. No real keys needed.
 
 ```powershell
-python -m venv .venv; .\.venv\Scripts\Activate.ps1; pip install -r requirements.txt
-pytest -q
-pytest evals/ -q
-python evals/run_evals.py
-uvicorn src.api.main:app --port 8000
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+$env:OPENAI_API_KEY="mock"
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m uvicorn src.api.main:app --port 8000
 ```
 
 Endpoints: `GET /healthz`, `POST /query`, `POST /query/stream` (SSE).
 
-Docker: `docker compose config` to validate; `docker compose up --build` to run
-api (:8000) + qdrant (:6333). App uses the in-memory store unless `QDRANT_URL` is set.
+```powershell
+Invoke-RestMethod -Uri http://127.0.0.1:8000/healthz
+Invoke-RestMethod -Uri http://127.0.0.1:8000/query -Method Post -ContentType "application/json" -Body '{"query":"OSPF neighbor stuck in EXSTART, troubleshoot adjacency","session_id":"demo"}'
+```
 
-## Defense (4 rungs)
+Streaming example (raw SSE token stream ending in `data: [DONE]`):
 
-- **Explain:** query → intent router → hybrid retrieve (Qdrant-style) → guardrail → mock-LLM respond → streamed tokens.
-- **Justify:** Qdrant-style store gives filtered payload indexing + cosine vectors in one place; in-memory fake keeps tests hermetic.
-- **Trade-off:** multi-step validation adds latency vs single-prompt calls, in exchange for blocking unauthorized CLI output.
-- **Scale & failure:** token-bucket backoff (429 + cached fallback); eval scores are computed by `evals/run_evals.py` — no hardcoded metric claims.
+```powershell
+Invoke-WebRequest -Uri http://127.0.0.1:8000/query/stream -Method Post -ContentType "application/json" -Body '{"query":"Explain BGP path selection","session_id":"demo"}'
+```
+
+Rate limiting: the token bucket holds 20 tokens refilling at 5/sec. `POST /query` costs 1 token, `POST /query/stream` costs 2. On `429`, `POST /query` returns the cached answer with `[cached fallback: rate-limited]` when the normalised query was seen before.
+
+## Project structure
+
+```text
+netops-copilot/
+  src/
+    api/
+      main.py            # FastAPI app: /healthz, /query, /query/stream, token bucket, CACHE
+    agents/
+      graph.py           # conditional graph built by build_default_graph()
+    guardrails/
+      filters.py         # QueryRequest / AgentResponse, CLI extraction, block markers
+  evals/
+    battery.py           # 14 retrieval + 20 hostile prompts
+    run_evals.py         # offline harness
+    live_bench.py        # live HTTP bench -> live_report.json
+    RESULTS.md           # measured results (source of Benchmarks above)
+    live_report.json     # 34 per-query rows
+  requirements.txt       # fastapi / uvicorn / pydantic / pytest / httpx pins
+  render.yaml            # Render Blueprint (python free service, /healthz check)
+  README.md              # this file
+```
+
+Only `src/api/main.py`, `render.yaml`, `requirements.txt`, and `evals/RESULTS.md` were used as factual sources for this README. Module filenames under `src/agents/` and `src/guardrails/` follow the imports in `src/api/main.py`.
+
+## Testing
+
+- Unit: `.\.venv\Scripts\python.exe -m pytest -q` runs the hermetic suite (in-memory store, mock embeddings and LLM, no network).
+- Eval schema tests: `.\.venv\Scripts\python.exe -m pytest evals/ -q` asserts harness output shape only, never literal metric values.
+- Offline evals: `.\.venv\Scripts\python.exe evals/run_evals.py` reproduces the deterministic battery without a server.
+- Live bench: start uvicorn on port 8055 with `OPENAI_API_KEY=mock`, then run `evals/live_bench.py --base-url http://127.0.0.1:8055 --out evals/live_report.json` (0.25 s pacing, backoff-and-retry on 429). Full repro commands and raw stdout are in `evals/RESULTS.md`.
+
+## Deployment
+
+- `render.yaml` defines one Python web service (`netops-copilot`, free plan, `rootDir: .`, `pip install -r requirements.txt`, `uvicorn src.api.main:app --host 0.0.0.0 --port $PORT`) with `healthCheckPath: /healthz`.
+- `/healthz` does zero external work (no Qdrant or LLM on that path), so it is safe for Render health checks and keepalive pings.
+- Free-tier services sleep when idle: expect a cold-start delay on the first request after inactivity.
+- Keepalive pointer: point a free cron-job.org job at `GET https://netops-copilot.onrender.com/healthz` every few minutes to reduce cold starts, as noted in `render.yaml` comments.
+
+## Contributing
+
+Small scoped PRs with a green `pytest -q` plus `pytest evals/ -q` run. Do not hardcode metric claims; every number in docs must come from a checked-in harness output (`evals/RESULTS.md` / `live_report.json`). Keep the mock-first constraint: no real keys, no network calls in tests.
+
+Quote the Benchmarks section verbatim when reusing numbers elsewhere, including
+the mock-stack caveat, and size every claim to the battery (for example,
+"across a 20-prompt hostile battery", never "across 500 scenarios").
+
+## License
+
+Private research project. All rights reserved unless a `LICENSE` file is added later.
