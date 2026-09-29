@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from src.agents.graph import build_default_graph
 from src.guardrails.filters import AgentResponse, QueryRequest
+from src.llm import provider
 
 app = FastAPI(title="netops-copilot", version="0.1.0")
 graph = build_default_graph()
@@ -40,11 +41,12 @@ CACHE: dict[str, dict] = {}
 class Health(BaseModel):
     status: str
     version: str
+    llm: str = "mock"  # real model id when GEMINI_API_KEY is configured
 
 
 @app.get("/healthz", response_model=Health)
 async def healthz() -> Health:
-    return Health(status="ok", version=app.version)
+    return Health(status="ok", version=app.version, llm=provider.model_name())
 
 
 @app.post("/query", response_model=AgentResponse)
@@ -54,11 +56,11 @@ async def query(req: QueryRequest) -> AgentResponse:
         key = req.query.strip().lower()
         if key in CACHE:
             c = CACHE[key]
-            return AgentResponse(answer=c["answer"] + "\n[cached fallback: rate-limited]", intent=c["intent"], sources=c["sources"])
+            return AgentResponse(answer=c["answer"] + "\n[cached fallback: rate-limited]", intent=c["intent"], sources=c["sources"], model=c.get("model", "mock"))
         raise HTTPException(status_code=429, detail="rate limited, retry later")
     state = await asyncio.to_thread(graph.run, req.query, req.session_id)
-    resp = AgentResponse(answer=state.answer, intent=state.intent, sources=state.sources, blocked=state.blocked)
-    CACHE[req.query.strip().lower()] = {"answer": state.answer, "intent": state.intent, "sources": state.sources}
+    resp = AgentResponse(answer=state.answer, intent=state.intent, sources=state.sources, blocked=state.blocked, model=state.model)
+    CACHE[req.query.strip().lower()] = {"answer": state.answer, "intent": state.intent, "sources": state.sources, "model": state.model}
     return resp
 
 
@@ -67,7 +69,7 @@ async def query_stream(req: QueryRequest):
     if not _allow(2):
         raise HTTPException(status_code=429, detail="rate limited, retry later")
     state = await asyncio.to_thread(graph.run, req.query, req.session_id)
-    CACHE[req.query.strip().lower()] = {"answer": state.answer, "intent": state.intent, "sources": state.sources}
+    CACHE[req.query.strip().lower()] = {"answer": state.answer, "intent": state.intent, "sources": state.sources, "model": state.model}
 
     async def gen() -> AsyncIterator[str]:
         for tok in state.answer.split():

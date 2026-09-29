@@ -71,6 +71,7 @@ class AgentResponse(BaseModel):
     intent: str
     sources: list[str] = []
     blocked: bool = False
+    model: str = "mock"  # provenance: real model id or "mock"
 
 
 def contains_injection(text: str) -> bool:

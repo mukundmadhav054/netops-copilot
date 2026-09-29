@@ -1,6 +1,6 @@
 # netops-copilot
 
-Agentic RAG assistant for NetOps troubleshoot / config / explain queries over a mock-first FastAPI service. No real API keys needed.
+Agentic RAG assistant for NetOps troubleshoot / config / explain queries over a mock-first FastAPI service. No real API keys needed — but set `GEMINI_API_KEY` and the same pipeline answers with real Gemini generation (`gemini-3.5-flash-lite`) and embeddings (`gemini-embedding-001`), falling back to mock on any API failure.
 
 ![stack](https://img.shields.io/static/v1?label=stack&message=python-fastapi-mock&color=blue)
 ![python](https://img.shields.io/static/v1?label=python&message=3.14&color=green)
@@ -21,6 +21,7 @@ Mock-first: deterministic mock embeddings plus mock LLM plus in-memory Qdrant-st
 
 - [Features](#features)
 - [Architecture](#architecture)
+- [Real-model path (Gemini)](#real-model-path-gemini)
 - [Benchmarks](#benchmarks)
 - [Tech stack](#tech-stack)
 - [Quickstart](#quickstart)
@@ -52,6 +53,17 @@ query
 
 `src/api/main.py` wires this together: `GET /healthz` returns `{status, version}`, `POST /query` runs `graph.run` on a worker thread and caches the answer per normalised query, and `POST /query/stream` runs the same graph then yields `data: <token>` events. The graph is built by `build_default_graph()` and the request/response shapes come from `QueryRequest` / `AgentResponse`.
 
+## Real-model path (Gemini)
+
+Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) and the pipeline upgrades in place:
+
+- Generation: grounded answers from `gemini-3.5-flash-lite` (freemium) via `src/llm/provider.py`, with the mock template as automatic fallback on quota/network/key errors — the API never 500s because of the model.
+- Retrieval: query and corpus embeddings from `gemini-embedding-001` (768-dim cosine) with the same per-call mock fallback plus corpus re-embed on dimension flips, so dense and sparse always share one space.
+- Guardrails still run on real-model output (defense in depth): a live injection test returned a Gemini-composed answer with the destructive command stripped to `[BLOCKED: unauthorized command removed]` and `blocked: true`.
+- Provenance: every `AgentResponse` carries `model` (`gemini-3.5-flash-lite` or `mock`); `/healthz` reports `llm` the same way. No key → entire stack runs offline on mocks (tests never touch the network).
+
+Free-tier note: generation is rate-limited (~10 req/min), so bursts fall back to mock gracefully; the token bucket plus cached fallback absorb the rest.
+
 ## Benchmarks
 
 All figures below are copied from `evals/RESULTS.md`, produced by the checked-in harnesses (`evals/run_evals.py` offline, `evals/live_bench.py` against a live local server). Same-machine loopback, `OPENAI_API_KEY=mock`, 34 per-query rows in `evals/live_report.json`.
@@ -74,7 +86,8 @@ Mock-stack caveat (from `evals/RESULTS.md`, read before quoting): mock stack thr
 | API | FastAPI 0.141.1 | `src/api/main.py`, app version `0.1.0` |
 | Server | Uvicorn 0.53.0 | local `:8000`, Render `$PORT` in production |
 | Schemas | Pydantic 2.13.5 | `QueryRequest`, `AgentResponse`, `Health` |
-| Retrieval | In-memory Qdrant-style store | mock dense embeddings plus BM25, top-3 sources |
+| Retrieval | In-memory Qdrant-style store | mock dense embeddings plus BM25, top-3 sources; Gemini `gemini-embedding-001` when keyed |
+| LLM | Mock template by default; Gemini `gemini-3.5-flash-lite` when `GEMINI_API_KEY` set | `src/llm/provider.py`, mock fallback on any failure, `model` provenance per response |
 | Agent | Pure-Python conditional graph | LangGraph-style, `build_default_graph()` |
 | Tests | Pytest 9.1.1, HTTPX 0.28.1 | unit plus `evals/` harness |
 | Deploy | Render Blueprint `render.yaml` | Python free web service, `/healthz` check |
@@ -107,6 +120,16 @@ Invoke-WebRequest -Uri http://127.0.0.1:8000/query/stream -Method Post -ContentT
 
 Rate limiting: the token bucket holds 20 tokens refilling at 5/sec. `POST /query` costs 1 token, `POST /query/stream` costs 2. On `429`, `POST /query` returns the cached answer with `[cached fallback: rate-limited]` when the normalised query was seen before.
 
+With a real model (optional, key never committed — see `.env.example`):
+
+```powershell
+$env:GEMINI_API_KEY="<your-key>"  # or GOOGLE_API_KEY; in-process only
+.\.venv\Scripts\python.exe -m uvicorn src.api.main:app --port 8000
+Invoke-RestMethod -Uri http://127.0.0.1:8000/healthz  # -> llm: gemini-3.5-flash-lite
+```
+
+Every answer then carries `"model": "gemini-3.5-flash-lite"` (or `"mock"` if the API call failed and fell back).
+
 ## Project structure
 
 ```text
@@ -118,13 +141,17 @@ netops-copilot/
       graph.py           # conditional graph built by build_default_graph()
     guardrails/
       filters.py         # QueryRequest / AgentResponse, CLI extraction, block markers
+    llm/
+      provider.py        # Gemini generate+embed with mock fallback, model provenance
+  tests/
+    test_provider.py     # mock-default + env-alias unit tests (no network)
   evals/
     battery.py           # 14 retrieval + 20 hostile prompts
     run_evals.py         # offline harness
     live_bench.py        # live HTTP bench -> live_report.json
     RESULTS.md           # measured results (source of Benchmarks above)
     live_report.json     # 34 per-query rows
-  requirements.txt       # fastapi / uvicorn / pydantic / pytest / httpx pins
+  requirements.txt       # fastapi / uvicorn / pydantic / pytest / httpx / google-genai pins
   render.yaml            # Render Blueprint (python free service, /healthz check)
   README.md              # this file
 ```
@@ -144,6 +171,7 @@ Only `src/api/main.py`, `render.yaml`, `requirements.txt`, and `evals/RESULTS.md
 - `/healthz` does zero external work (no Qdrant or LLM on that path), so it is safe for Render health checks and keepalive pings.
 - Free-tier services sleep when idle: expect a cold-start delay on the first request after inactivity.
 - Keepalive pointer: point a free cron-job.org job at `GET https://netops-copilot.onrender.com/healthz` every few minutes to reduce cold starts, as noted in `render.yaml` comments.
+- Real-model key: set `GEMINI_API_KEY` as a Render Secret env var (Dashboard → service → Environment), never in code or `render.yaml`; the deployed service then answers with Gemini and reports it in `/healthz` (`llm` field), still falling back to mock under quota pressure.
 
 ## Contributing
 

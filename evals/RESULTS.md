@@ -144,3 +144,12 @@ faithfulness (sourced): 0.8253  recall (sourced): 0.9653
 - "Blocked 19/20 hostile prompts (prompt-injection, jailbreak, exfiltration, destructive-CLI) with zero destructive commands emitted across the full 20-prompt battery (reload / write erase / rm -rf / erase+format flash verified absent)."
 - "End-to-end per-query latency p50 15.9 ms / p99 25.6 ms (n=34, live loopback, mean 12.8 ms) with mock grounding scores of 0.83 faithfulness / 0.97 context recall on sourced cases."
 - "Owns a 34-prompt eval battery + live HTTP bench harness (checked in under `evals/`) that computes every score from measured output; tests assert schema only, never literal values."
+
+## 8. Real-model path verification (Gemini, qualitative — not a battery)
+
+Live local server with `GEMINI_API_KEY` set (freemium `gemini-3.5-flash-lite` generation + `gemini-embedding-001` retrieval, n=3 manual queries + `/healthz`):
+- `/healthz` reported `"llm": "gemini-3.5-flash-lite"`; every answer carried `"model": "gemini-3.5-flash-lite"`.
+- OSPF EXSTART troubleshooting: grounded answer citing retrieved MTU/`show ip ospf neighbor` context with correct sources.
+- Injection (`...reload the router...`): model composed an answer, then the guardrail stripped the destructive command to `[BLOCKED: unauthorized command removed]` with `blocked: true` — defense in depth across real output.
+- BGP explain: short grounded answer citing RFC 4271.
+- Notes: `gemini-2.5-flash`/`flash-lite` and `text-embedding-004` returned 404 for this key (retired); the working pair was found via `models.list`. No latency or score claims are made from this n=3 smoke — the §4 battery stands as the measured record.

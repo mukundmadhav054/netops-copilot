@@ -51,6 +51,7 @@ class GraphState:
     sources: list[str] = field(default_factory=list)
     answer: str = ""
     blocked: bool = False
+    model: str = "mock"  # provenance: real model id or "mock"
     history: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -88,9 +89,14 @@ class ConditionalGraph:
         return s
 
     def _respond(self, s: GraphState) -> GraphState:
-        raw = mock_llm(s.intent, s.query, s.contexts)
-        safe, blocked = guard_response(raw)
-        s.answer, s.blocked = safe, blocked
+        from src.llm import provider
+
+        raw, model = provider.generate_answer(
+            s.intent, s.query, s.contexts,
+            lambda: mock_llm(s.intent, s.query, s.contexts),
+        )
+        safe, blocked = guard_response(raw)  # guardrails apply to real output too
+        s.answer, s.blocked, s.model = safe, blocked, model
         s.history.append({"q": s.query, "a": s.answer, "intent": s.intent})
         return s
 
@@ -102,9 +108,18 @@ class ConditionalGraph:
         return state
 
 
-def build_default_graph() -> ConditionalGraph:
-    """Seeded retriever with sample networking docs for API/tests."""
-    r = HybridRetriever()
+def build_default_graph(embed_fn=None) -> ConditionalGraph:
+    """Seeded retriever with sample networking docs for API/tests.
+
+    `embed_fn=None` (default) auto-detects: real Gemini embeddings when a
+    key is configured, mock otherwise. Pass an explicit function to pin
+    either path (tests pin mock).
+    """
+    from src.llm import provider
+
+    if embed_fn is None and provider.is_configured():
+        embed_fn = provider.embed_texts  # None-tolerant: falls back per call
+    r = HybridRetriever(embed_fn=embed_fn)
     r.add(
         [
             "OSPF neighbor troubleshooting: use `show ip ospf neighbor` to verify FULL state. If stuck in EXSTART, check MTU with `show interfaces status`. RFC 2328 defines OSPF adjacency states.",

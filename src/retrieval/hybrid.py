@@ -25,8 +25,18 @@ def mock_embed(text: str, dim: int = DIM) -> list[float]:
     return [v / norm for v in vec]
 
 
+def mock_embed_batch(texts: list[str]) -> list[list[float]]:
+    return [mock_embed(t) for t in texts]
+
+
 def _cosine(a: list[float], b: list[float]) -> float:
-    return sum(x * y for x, y in zip(a, b))
+    # True cosine (not dot product): provider vectors are not normalized.
+    num = sum(x * y for x, y in zip(a, b))
+    da = math.sqrt(sum(x * x for x in a))
+    db = math.sqrt(sum(y * y for y in b))
+    if not da or not db:
+        return 0.0
+    return num / (da * db)
 
 
 def _bm25_score(query_terms: list[str], doc_terms: list[str], avg_len: float, n_docs: int, doc_freq: dict[str, int]) -> float:
@@ -54,21 +64,51 @@ class Document:
 
 
 class InMemoryQdrant:
-    """Fake Qdrant collection: cosine vector search + payload filter."""
+    """Fake Qdrant collection: cosine vector search + payload filter.
 
-    def __init__(self, distance: str = "cosine"):
+    `embed_fn`, when given, replaces mock embeddings (e.g. Gemini). It must
+    take a list of texts and return a list of vectors, or a falsy value to
+    fall back to mock. Dimension flips (provider flapping mid-life) trigger
+    a corpus re-embed so query and docs always share a space.
+    """
+
+    def __init__(self, distance: str = "cosine", embed_fn=None):
         self.distance = distance
+        self.embed_fn = embed_fn
         self.docs: list[Document] = []
         self.vectors: list[list[float]] = []
+        self.dim: int | None = None
+
+    def _batch(self, texts: list[str]) -> list[list[float]]:
+        if self.embed_fn is not None:
+            try:
+                vecs = self.embed_fn(texts)
+                if vecs and len(vecs) == len(texts) and all(len(v) > 0 for v in vecs):
+                    return [list(map(float, v)) for v in vecs]
+            except Exception:
+                pass
+        return mock_embed_batch(texts)
+
+    def _ensure_dim(self, dim: int) -> None:
+        if self.dim is None:
+            self.dim = dim
+        elif self.dim != dim:  # provider flapped: re-embed corpus for consistency
+            self.vectors = self._batch([d.text for d in self.docs])
+            self.dim = len(self.vectors[0]) if self.vectors else dim
 
     def upsert(self, docs: list[Document]) -> None:
-        for d in docs:
+        vecs = self._batch([d.text for d in docs]) if docs else []
+        for d, v in zip(docs, vecs):
             self.docs.append(d)
-            self.vectors.append(mock_embed(d.text))
+            self.vectors.append(v)
+        if vecs:
+            self._ensure_dim(len(vecs[0]))
 
     def search(self, query_vector: list[float], limit: int = 3, payload_filter: dict | None = None):
         scored = []
         for d, v in zip(self.docs, self.vectors):
+            if len(v) != len(query_vector):
+                continue
             if payload_filter:
                 if any(d.payload.get(k) != val for k, val in payload_filter.items()):
                     continue
@@ -76,13 +116,22 @@ class InMemoryQdrant:
         scored.sort(key=lambda x: x[1], reverse=True)
         return scored[:limit]
 
+    def embed_query(self, text: str) -> list[float]:
+        vecs = self._batch([text])
+        q = vecs[0] if vecs else mock_embed(text)
+        if self.dim is not None and len(q) != self.dim:
+            q = mock_embed(text)  # transient provider miss: stay in corpus space
+            if len(q) != self.dim:
+                return []
+        return q
+
 
 class HybridRetriever:
     """Dense pre-filter + BM25 re-rank fusion, returns top-k dicts."""
 
-    def __init__(self, alpha: float = 0.5):
+    def __init__(self, alpha: float = 0.5, embed_fn=None):
         self.alpha = alpha
-        self.store = InMemoryQdrant(distance="cosine")
+        self.store = InMemoryQdrant(distance="cosine", embed_fn=embed_fn)
         self._terms: list[list[str]] = []
 
     def add(self, texts: list[str], metadatas: list[dict] | None = None) -> None:
@@ -97,7 +146,9 @@ class HybridRetriever:
     def search(self, query: str, top_k: int = 3, payload_filter: dict | None = None) -> list[dict]:
         if not self.store.docs:
             return []
-        qvec = mock_embed(query)
+        qvec = self.store.embed_query(query)
+        if not qvec:
+            return []
         dense = self.store.search(qvec, limit=len(self.store.docs), payload_filter=payload_filter)
         q_terms = re.findall(r"[a-z0-9]+", query.lower())
         n = len(self._terms)
