@@ -101,11 +101,16 @@ def filter_cli_commands(commands: list[str]) -> list[str]:
 
 
 def extract_cli_candidates(text: str) -> list[str]:
-    """Naive extractor: lines that look like CLI commands."""
+    """Naive extractor: lines that look like CLI commands.
+
+    The verb must be followed by whitespace/end-of-line so prose lines that
+    merely start with e.g. "Ping/..." (like our own diagnostics doc) are not
+    treated as commands.
+    """
     out = []
     for line in text.splitlines():
         s = line.strip().strip("`").strip()
-        if re.match(r"^(show|ping|traceroute|reload|write|erase|format|delete|shutdown|debug|configure|interface|ip route|router ospf|copy|no |rm\s)", s, re.IGNORECASE):
+        if re.match(r"^(show|ping|traceroute|reload|write|erase|format|delete|shutdown|debug|configure|interface|ip route|router ospf|copy|no|rm)(?=\s|$)", s, re.IGNORECASE):
             out.append(s)
     return out
 
