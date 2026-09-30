@@ -15,7 +15,7 @@ The deployed service runs the same mock-first stack as local: no external vector
 and no real LLM on any path unless `QDRANT_URL` is set, in which case the app
 can attach to a real Qdrant service instead of the in-memory store.
 
-Mock-first: deterministic mock embeddings plus mock LLM plus in-memory Qdrant-style store. `OPENAI_API_KEY=mock` is the only key you need; nothing calls a real model or vector cloud.
+Mock-first: deterministic mock embeddings plus mock LLM plus Qdrant (in-memory by default; `QDRANT_URL` attaches a real service) plus BM25. `OPENAI_API_KEY=mock` is the only key you need for the offline path; nothing calls a real model or vector cloud.
 
 ## Table of contents
 
@@ -34,7 +34,7 @@ Mock-first: deterministic mock embeddings plus mock LLM plus in-memory Qdrant-st
 ## Features
 
 - Intent router: every query is classified as `troubleshoot`, `config`, `explain`, or `unsupported` before retrieval, so greetings and thank-yous take the refusal path with no sources expected.
-- Hybrid dense plus BM25 retrieval: mock dense embeddings plus BM25 over an in-memory Qdrant-style store holding seeded NetOps docs, returning top-3 sources with filtered payloads.
+- Hybrid dense plus BM25 retrieval: mock dense embeddings plus BM25 over real Qdrant (in-memory by default, cosine + payload filtering), returning top-3 sources with filtered payloads; Gemini `gemini-embedding-001` vectors when keyed, with corpus re-embed on dimension flips.
 - Guardrails: injection, jailbreak, exfiltration, and destructive-CLI prompts are blocked via a `blocked` flag, `unsupported` intent, refusal text, or a visible `[blocked]` / `[SANITIZED]` / `[BLOCKED: ...]` marker. The bar is zero unauthorized CLI commands emitted.
 - Streaming: `POST /query/stream` reuses the same graph path as `POST /query` and streams whitespace-delimited tokens as Server-Sent Events (`text/event-stream`) ending in `data: [DONE]`.
 - Eval battery: checked-in `evals/` harness with a 14-prompt retrieval battery plus a 20-prompt hostile battery, an offline runner, and a live HTTP bench that writes `evals/live_report.json`.
@@ -45,7 +45,7 @@ Mock-first: deterministic mock embeddings plus mock LLM plus in-memory Qdrant-st
 ```text
 query
   -> intent router (troubleshoot / config / explain / unsupported)
-  -> hybrid retrieve (mock dense + BM25 over in-memory Qdrant-style store, top-3)
+  -> hybrid retrieve (Qdrant cosine + BM25 over seeded NetOps docs, top-3)
   -> guardrail (block injection / exfiltration / destructive CLI, sanitise output)
   -> mock-LLM respond (grounded in retrieved contexts)
   -> SSE (POST /query/stream token stream, ends with [DONE])
@@ -66,7 +66,7 @@ Free-tier note: generation is rate-limited (~10 req/min), so bursts fall back to
 
 ## Benchmarks
 
-All figures below are copied from `evals/RESULTS.md`, produced by the checked-in harnesses (`evals/run_evals.py` offline, `evals/live_bench.py` against a live local server). Same-machine loopback, `OPENAI_API_KEY=mock`, 34 per-query rows in `evals/live_report.json`.
+All figures below are copied from `evals/RESULTS.md`, produced by the checked-in harnesses (`evals/run_evals.py` offline, `evals/live_bench.py` against a live local server). Same-machine loopback, `OPENAI_API_KEY=mock`, 34 per-query rows in `evals/live_report.json`. A second full run against live Gemini (`gemini-3.5-flash-lite` + `gemini-embedding-001` + Qdrant, `evals/live_report_gemini.json`, per-query model provenance) is recorded in RESULTS.md §4b — quote the two runs separately, never mixed.
 
 - Intent-routing accuracy: **14/14 = 1.0** (troubleshoot/config/explain/unsupported).
 - Retrieval hit rate (expected source in top-3): **12/12 = 1.0**.
@@ -86,7 +86,7 @@ Mock-stack caveat (from `evals/RESULTS.md`, read before quoting): mock stack thr
 | API | FastAPI 0.141.1 | `src/api/main.py`, app version `0.1.0` |
 | Server | Uvicorn 0.53.0 | local `:8000`, Render `$PORT` in production |
 | Schemas | Pydantic 2.13.5 | `QueryRequest`, `AgentResponse`, `Health` |
-| Retrieval | In-memory Qdrant-style store | mock dense embeddings plus BM25, top-3 sources; Gemini `gemini-embedding-001` when keyed |
+| Retrieval | Qdrant 1.19 (in-memory default, `QDRANT_URL` for remote) | cosine dense vectors plus BM25, top-3 sources; Gemini `gemini-embedding-001` when keyed |
 | LLM | Mock template by default; Gemini `gemini-3.5-flash-lite` when `GEMINI_API_KEY` set | `src/llm/provider.py`, mock fallback on any failure, `model` provenance per response |
 | Agent | Pure-Python conditional graph | LangGraph-style, `build_default_graph()` |
 | Tests | Pytest 9.1.1, HTTPX 0.28.1 | unit plus `evals/` harness |
@@ -141,6 +141,9 @@ netops-copilot/
       graph.py           # conditional graph built by build_default_graph()
     guardrails/
       filters.py         # QueryRequest / AgentResponse, CLI extraction, block markers
+    retrieval/
+      hybrid.py          # HybridRetriever: dense pre-filter + BM25 re-rank, build_store()
+      qdrant_store.py    # real Qdrant backend (memory default, remote via QDRANT_URL)
     llm/
       provider.py        # Gemini generate+embed with mock fallback, model provenance
   tests/

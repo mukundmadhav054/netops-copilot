@@ -25,6 +25,7 @@ ALLOWED_CLI_PREFIXES = (
     "traceroute ",
     "configure terminal",
     "interface ",
+    "no shutdown",  # interface bring-up is safe; bare/box-level shutdown stays blocked
     "ip route ",
     "router ospf ",
     "copy running-config",

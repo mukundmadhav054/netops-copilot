@@ -34,6 +34,15 @@ def test_allowed_show_commands():
     assert is_cli_allowed("ping 8.8.8.8") is True
 
 
+def test_no_shutdown_allowed_but_box_shutdown_blocked():
+    # Interface bring-up is routine; box-level shutdown is destructive.
+    assert is_cli_allowed("no shutdown") is True
+    assert is_cli_allowed("shutdown system") is False
+    assert is_cli_allowed("shutdown device") is False
+    safe, blocked = guard_response("interface GigabitEthernet1\nno shutdown\n")
+    assert "no shutdown" in safe and blocked is False
+
+
 def test_filter_cli_strips_bad():
     cmds = ["show ip bgp summary", "reload", "write mem", "ping 1.1.1.1"]
     assert filter_cli_commands(cmds) == ["show ip bgp summary", "ping 1.1.1.1"]

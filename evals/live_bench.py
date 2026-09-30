@@ -94,6 +94,8 @@ def summarize(rows: list[dict]) -> dict:
     sourced = [r for r in ret_rows if r.get("expected_source")]
     ret_lat = sorted(r["latency_ms"] for r in ret_rows)
     inj_lat = sorted(r["latency_ms"] for r in inj_rows)
+    gem_rows = [r for r in rows if r.get("model", "mock") != "mock"]
+    gem_lat = sorted(r["latency_ms"] for r in gem_rows)
     return {
         "n_total": len(rows),
         "n_retrieval": len(ret_rows),
@@ -133,6 +135,14 @@ def summarize(rows: list[dict]) -> dict:
             sum(r["context_recall"] for r in sourced) / max(len(sourced), 1), 4
         ),
         "n_429_retries": sum(r["n_429"] for r in rows),
+        "n_gemini_backed": len(gem_rows),
+        "gemini_models": sorted({r.get("model", "mock") for r in gem_rows}),
+        "gemini_latency_ms": {
+            "n": len(gem_lat),
+            "p50": round(_percentile(gem_lat, 0.50), 2) if gem_lat else 0.0,
+            "p99": round(_percentile(gem_lat, 0.99), 2) if gem_lat else 0.0,
+            "max": round(gem_lat[-1], 2) if gem_lat else 0.0,
+        },
         "rows": rows,
     }
 
@@ -152,6 +162,7 @@ def run_bench(base_url: str, pause_s: float = 0.25) -> dict:
             "group": "retrieval",
             "query": case["query"],
             "latency_ms": round(latency_ms, 2),
+            "model": body.get("model", "mock"),
             "n_429": n_429,
             "expected_intent": case["expected_intent"],
             "intent": body.get("intent", ""),
@@ -173,6 +184,7 @@ def run_bench(base_url: str, pause_s: float = 0.25) -> dict:
                 "group": "injection",
                 "query": prompt,
                 "latency_ms": round(latency_ms, 2),
+                "model": body.get("model", "mock"),
                 "n_429": n_429,
                 "intent": body.get("intent", ""),
                 "blocked_flag": bool(body.get("blocked", False)),
@@ -221,13 +233,18 @@ def main() -> None:
     print(f"faithfulness (sourced): {report['mean_faithfulness']}  "
           f"recall (sourced): {report['mean_context_recall']}")
     print(f"429 retries: {report['n_429_retries']}")
+    print(f"gemini-backed: {report['n_gemini_backed']}/{report['n_total']} "
+          f"{report['gemini_models']} "
+          f"(p50={report['gemini_latency_ms']['p50']}ms p99={report['gemini_latency_ms']['p99']}ms)")
     for r in rows:
         if r["group"] == "retrieval":
             print(f"  [retr {r['latency_ms']:7.2f}ms intent={r['intent']:<13} "
-                  f"ok={int(r['intent_ok'])} hit={int(r['hit'])} blk={int(r['blocked_flag'])}] {r['query'][:60]}")
+                  f"ok={int(r['intent_ok'])} hit={int(r['hit'])} blk={int(r['blocked_flag'])} "
+                  f"model={r.get('model', 'mock')}] {r['query'][:60]}")
         else:
             print(f"  [inj  {r['latency_ms']:7.2f}ms intent={r['intent']:<13} "
-                  f"blocked={int(r['blocked'])} leaks={r['leaks']}] {r['query'][:60]}")
+                  f"blocked={int(r['blocked'])} leaks={r['leaks']} "
+                  f"model={r.get('model', 'mock')}] {r['query'][:60]}")
     out = args.out
     if not os.path.isabs(out):
         out = os.path.join(

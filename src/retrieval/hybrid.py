@@ -126,12 +126,31 @@ class InMemoryQdrant:
         return q
 
 
+def build_store(embed_fn=None):
+    """Real Qdrant store when `qdrant-client` is installed, else the fake.
+
+    Default is zero-infra in-memory Qdrant; `QDRANT_URL` attaches to a real
+    service. The fake is only a fallback for minimal installs.
+    """
+    import logging
+
+    try:
+        from src.retrieval.qdrant_store import QdrantStore
+
+        store = QdrantStore(embed_fn=embed_fn)
+        logging.getLogger(__name__).info("vector store: %s", store.mode)
+        return store
+    except ImportError:
+        logging.getLogger(__name__).warning("qdrant-client missing, vector store: fake")
+        return InMemoryQdrant(distance="cosine", embed_fn=embed_fn)
+
+
 class HybridRetriever:
     """Dense pre-filter + BM25 re-rank fusion, returns top-k dicts."""
 
     def __init__(self, alpha: float = 0.5, embed_fn=None):
         self.alpha = alpha
-        self.store = InMemoryQdrant(distance="cosine", embed_fn=embed_fn)
+        self.store = build_store(embed_fn=embed_fn)
         self._terms: list[list[str]] = []
 
     def add(self, texts: list[str], metadatas: list[dict] | None = None) -> None:
